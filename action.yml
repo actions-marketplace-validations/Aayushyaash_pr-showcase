@@ -34,6 +34,14 @@ inputs:
     description: 'Alignment of contributed-to project star badges: left | center | right'
     required: false
     default: 'left'
+  coauthored_prs:
+    description: 'Comma, whitespace, or newline-separated list of PRs co-authored by the user (owner/repo#number)'
+    required: false
+    default: ''
+  force_merged_prs:
+    description: 'Comma, whitespace, or newline-separated list of PRs to force-treat as merged (owner/repo#number)'
+    required: false
+    default: ''
 
 runs:
   using: 'composite'
@@ -53,4 +61,6 @@ runs:
         PR_SHOWCASE_SHOW_STARS: ${{ inputs.show_stars }}
         PR_SHOWCASE_BADGE_ALIGNMENT: ${{ inputs.badge_alignment }}
         PR_SHOWCASE_CONTRIBUTED_TO_ALIGNMENT: ${{ inputs.contributed_to_alignment }}
+        PR_SHOWCASE_COAUTHORED_PRS: ${{ inputs.coauthored_prs }}
+        PR_SHOWCASE_FORCE_MERGED_PRS: ${{ inputs.force_merged_prs }}
       run: python3 ${{ github.action_path }}/scripts/update_contributions.py

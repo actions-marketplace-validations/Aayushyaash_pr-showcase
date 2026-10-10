@@ -49,6 +49,31 @@ query($query: String!, $cursor: String) {
         merged
         mergedAt
         createdAt
+        timelineItems(itemTypes: [CLOSED_EVENT], last: 1) {
+          nodes {
+            ... on ClosedEvent {
+              closer {
+                ... on Commit {
+                  oid
+                  url
+                }
+              }
+            }
+          }
+        }
+        comments(last: 3) {
+          nodes {
+            author {
+              login
+            }
+            body
+          }
+        }
+        labels(first: 5) {
+          nodes {
+            name
+          }
+        }
         repository {
           nameWithOwner
           name
@@ -64,6 +89,79 @@ query($query: String!, $cursor: String) {
   }
 }
 """
+
+SYNTHETIC_MERGE_PATTERNS = [
+    re.compile(r"This pull request has been merged in [^\s]+@([0-9a-fA-F]{7,40})"),
+    re.compile(r"(?:Closed by commit|Merged in)\s+([0-9a-fA-F]{7,40})"),
+    re.compile(r"(?:Merged via commit|Pushed to [^\s]+ as commit)\s+([0-9a-fA-F]{7,40})"),
+]
+
+MERGE_LABELS = {
+    "merged-upstream",
+    "status: merged",
+    "status:merged",
+    "landed",
+}
+
+
+def parse_pr_references(raw_input: str | None) -> list[tuple[str, str, int]]:
+    """Parse PR references in format 'owner/repo#number' or full GitHub PR URLs."""
+    if not raw_input:
+        return []
+    refs = []
+    tokens = re.split(r"[\s,]+", raw_input.strip())
+    for token in tokens:
+        if not token:
+            continue
+        url_match = re.match(
+            r"^https?://github\.com/([^/]+)/([^/]+)/pull/(\d+)", token, re.IGNORECASE
+        )
+        if url_match:
+            refs.append((url_match.group(1), url_match.group(2), int(url_match.group(3))))
+            continue
+        ref_match = re.match(r"^([^/]+)/([^#]+)#(\d+)$", token)
+        if ref_match:
+            refs.append((ref_match.group(1), ref_match.group(2), int(ref_match.group(3))))
+            continue
+    return refs
+
+
+def is_synthetically_merged(
+    node: dict, force_merged_prs: set[str] | None = None
+) -> bool:
+    """Determine if a closed PR was merged via an external bot/monorepo sync or whitelist."""
+    repo_name = (node.get("repository") or {}).get("nameWithOwner", "")
+    pr_num = node.get("number")
+    pr_ref = f"{repo_name}#{pr_num}".lower() if repo_name and pr_num else ""
+
+    # 0. Whitelist / force-merged override
+    if force_merged_prs and pr_ref and (pr_ref in force_merged_prs or str(pr_num) in force_merged_prs):
+        return True
+
+    # 1. GitHub Knowledge Graph: timelineItems ClosedEvent.closer is a Commit
+    timeline_nodes = (node.get("timelineItems") or {}).get("nodes") or []
+    for item in timeline_nodes:
+        closer = (item or {}).get("closer")
+        if closer and closer.get("oid"):
+            return True
+
+    # 2. Bot Comment Signatures
+    comments = (node.get("comments") or {}).get("nodes") or []
+    for comment in comments:
+        body = (comment or {}).get("body") or ""
+        for pattern in SYNTHETIC_MERGE_PATTERNS:
+            if pattern.search(body):
+                return True
+
+    # 3. Upstream Land/Merge Labels
+    labels = (node.get("labels") or {}).get("nodes") or []
+    for label in labels:
+        name = ((label or {}).get("name") or "").strip().lower()
+        if name in MERGE_LABELS:
+            return True
+
+    return False
+
 
 
 def get_default_config() -> dict:
@@ -135,7 +233,9 @@ def request_http(url: str, token: str | None = None, data: bytes | None = None) 
         return json.load(resp)
 
 
-def parse_graphql_nodes(nodes: list[dict]) -> tuple[list[dict], dict[str, dict]]:
+def parse_graphql_nodes(
+    nodes: list[dict], force_merged_prs: set[str] | None = None
+) -> tuple[list[dict], dict[str, dict]]:
     """Normalize raw GraphQL search nodes into structured PR and repository records."""
     prs = []
     repos = {}
@@ -158,6 +258,9 @@ def parse_graphql_nodes(nodes: list[dict]) -> tuple[list[dict], dict[str, dict]]
             }
 
         merged = bool(node.get("merged") or node.get("mergedAt"))
+        if not merged and node.get("state") == "CLOSED":
+            merged = is_synthetically_merged(node, force_merged_prs)
+
         state = (
             "merged"
             if merged
@@ -183,7 +286,7 @@ def parse_graphql_nodes(nodes: list[dict]) -> tuple[list[dict], dict[str, dict]]
 
 
 def fetch_contributions_graphql(
-    username: str, token: str
+    username: str, token: str, force_merged_prs: set[str] | None = None
 ) -> tuple[list[dict], dict[str, dict]]:
     """Fetch user PRs and repository metadata in a single GraphQL query."""
     url = "https://api.github.com/graphql"
@@ -214,11 +317,13 @@ def fetch_contributions_graphql(
         if not cursor:
             break
 
-    return parse_graphql_nodes(nodes)
+    return parse_graphql_nodes(nodes, force_merged_prs=force_merged_prs)
 
 
 def fetch_contributions_rest(
-    username: str, token: str | None = None
+    username: str,
+    token: str | None = None,
+    force_merged_prs: set[str] | None = None,
 ) -> tuple[list[dict], dict[str, dict]]:
     """Fallback REST API ingestion when GraphQL is inaccessible."""
     q = urllib.parse.quote(f"author:{username} is:pr -user:{username} is:public")
@@ -239,7 +344,11 @@ def fetch_contributions_rest(
     for it in items:
         repo = "/".join(it["repository_url"].split("/")[-2:])
         pr_info = it.get("pull_request") or {}
+        pr_ref = f"{repo}#{it['number']}".lower()
         merged = bool(pr_info.get("merged_at"))
+        if not merged and it.get("state") == "closed" and force_merged_prs:
+            if pr_ref in force_merged_prs or str(it["number"]) in force_merged_prs:
+                merged = True
 
         state = "merged" if merged else ("open" if it["state"] == "open" else "closed")
         if state not in ("merged", "open"):
@@ -284,6 +393,185 @@ def fetch_contributions_rest(
                 "stars": 0,
                 "owner_avatar": get_owner_avatar(repo),
             }
+
+    return prs, repos
+
+
+def fetch_coauthored_prs_graphql(
+    refs: list[tuple[str, str, int]],
+    token: str,
+    force_merged_prs: set[str] | None = None,
+) -> tuple[list[dict], dict[str, dict]]:
+    """Fetch declared co-authored PRs using an aliased GraphQL batch query."""
+    if not refs:
+        return [], {}
+
+    query_parts = ["query GetCoauthoredPRs {"]
+    for i, (owner, repo, number) in enumerate(refs):
+        query_parts.append(
+            f"""  pr_{i}: repository(owner: "{owner}", name: "{repo}") {{
+    pullRequest(number: {number}) {{
+      number
+      title
+      url
+      state
+      merged
+      mergedAt
+      createdAt
+      timelineItems(itemTypes: [CLOSED_EVENT], last: 1) {{
+        nodes {{
+          ... on ClosedEvent {{
+            closer {{
+              ... on Commit {{
+                oid
+                url
+              }}
+            }}
+          }}
+        }}
+      }}
+      comments(last: 3) {{
+        nodes {{
+          author {{ login }}
+          body
+        }}
+      }}
+      labels(first: 5) {{
+        nodes {{ name }}
+      }}
+      repository {{
+        nameWithOwner
+        name
+        description
+        stargazerCount
+        owner {{
+          login
+          avatarUrl(size: 64)
+        }}
+      }}
+    }}
+  }}"""
+        )
+    query_parts.append("}")
+    full_query = "\n".join(query_parts)
+
+    url = "https://api.github.com/graphql"
+    payload = json.dumps({"query": full_query}).encode("utf-8")
+    try:
+        response = request_http(url, token=token, data=payload)
+    except Exception as exc:
+        print(
+            f"[pr-showcase] Failed to fetch co-authored PRs via GraphQL ({exc})",
+            file=sys.stderr,
+        )
+        return [], {}
+
+    data = response.get("data") or {}
+    coauthored_prs = []
+    repos = {}
+
+    for i, (owner, repo, number) in enumerate(refs):
+        alias_data = data.get(f"pr_{i}")
+        if not alias_data:
+            continue
+        pr_node = alias_data.get("pullRequest")
+        if not pr_node or not pr_node.get("repository"):
+            continue
+
+        repo_data = pr_node["repository"]
+        repo_name = repo_data["nameWithOwner"]
+
+        if repo_name not in repos:
+            owner_data = repo_data.get("owner") or {}
+            repos[repo_name] = {
+                "name": repo_name,
+                "description": repo_data.get("description") or repo_name,
+                "stars": repo_data.get("stargazerCount", 0),
+                "owner_avatar": get_owner_avatar(repo_name, owner_data),
+            }
+
+        merged = bool(pr_node.get("merged") or pr_node.get("mergedAt"))
+        if not merged and pr_node.get("state") == "CLOSED":
+            merged = is_synthetically_merged(pr_node, force_merged_prs)
+
+        state = (
+            "merged"
+            if merged
+            else ("open" if pr_node.get("state") == "OPEN" else "closed")
+        )
+
+        if state not in ("merged", "open"):
+            continue
+
+        coauthored_prs.append(
+            {
+                "repo": repo_name,
+                "number": pr_node["number"],
+                "title": pr_node["title"].rstrip("…").strip(),
+                "url": pr_node["url"],
+                "state": state,
+                "created": pr_node.get("createdAt", "")[:10],
+                "is_coauthor": True,
+            }
+        )
+
+    return coauthored_prs, repos
+
+
+def fetch_coauthored_prs_rest(
+    refs: list[tuple[str, str, int]],
+    token: str | None = None,
+    force_merged_prs: set[str] | None = None,
+) -> tuple[list[dict], dict[str, dict]]:
+    """Fetch declared co-authored PRs using REST API fallback."""
+    if not refs:
+        return [], {}
+
+    prs = []
+    repos = {}
+    for owner, repo_name, number in refs:
+        full_repo = f"{owner}/{repo_name}"
+        pr_ref = f"{full_repo}#{number}".lower()
+        try:
+            pr_data = request_http(
+                f"https://api.github.com/repos/{full_repo}/pulls/{number}", token=token
+            )
+            merged = bool(pr_data.get("merged_at"))
+            if not merged and pr_data.get("state") == "closed" and force_merged_prs:
+                if pr_ref in force_merged_prs or str(number) in force_merged_prs:
+                    merged = True
+
+            state = (
+                "merged"
+                if merged
+                else ("open" if pr_data.get("state") == "open" else "closed")
+            )
+            if state not in ("merged", "open"):
+                continue
+
+            if full_repo not in repos:
+                repo_data = pr_data.get("base", {}).get("repo") or {}
+                owner_data = repo_data.get("owner") or {}
+                repos[full_repo] = {
+                    "name": full_repo,
+                    "description": repo_data.get("description") or full_repo,
+                    "stars": repo_data.get("stargazers_count", 0),
+                    "owner_avatar": get_owner_avatar(full_repo, owner_data),
+                }
+
+            prs.append(
+                {
+                    "repo": full_repo,
+                    "number": pr_data["number"],
+                    "title": pr_data["title"].rstrip("…").strip(),
+                    "url": pr_data["html_url"],
+                    "state": state,
+                    "created": pr_data.get("created_at", "")[:10],
+                    "is_coauthor": True,
+                }
+            )
+        except Exception:
+            continue
 
     return prs, repos
 
@@ -337,7 +625,8 @@ def render_grouped_prs(
         )
         lines.append(format_repo_header(repo_info, mode))
         for p in sorted(by_repo[repo], key=lambda x: x["number"], reverse=True):
-            lines.append(f"- [#{p['number']}]({p['url']}) {p['title']}")
+            suffix = " *(Co-author)*" if p.get("is_coauthor") else ""
+            lines.append(f"- [#{p['number']}]({p['url']}) {p['title']}{suffix}")
         lines.append("")
     return lines
 
@@ -637,6 +926,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Alignment of contributed-to project star badges.",
     )
     parser.add_argument(
+        "--coauthored-prs",
+        default=os.environ.get("PR_SHOWCASE_COAUTHORED_PRS", ""),
+        help="Comma, whitespace, or newline-separated list of PRs co-authored by the user (owner/repo#number).",
+    )
+    parser.add_argument(
+        "--force-merged-prs",
+        default=os.environ.get("PR_SHOWCASE_FORCE_MERGED_PRS", ""),
+        help="Comma, whitespace, or newline-separated list of PRs to force-treat as merged (owner/repo#number).",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Print rendered markdown to stdout without modifying target file.",
@@ -646,6 +945,13 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     """CLI and Action entrypoint."""
+    # Ensure stdout handles UTF-8 on Windows
+    if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
+        try:
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        except AttributeError:
+            pass
+
     parser = build_parser()
     args = parser.parse_args(argv)
 
@@ -657,10 +963,19 @@ def main(argv: list[str] | None = None) -> int:
 
     token = resolve_token(args.token)
 
+    # Resolve force-merged PR set
+    force_merged_list = parse_pr_references(args.force_merged_prs)
+    force_merged_set = {f"{o}/{r}#{n}".lower() for o, r, n in force_merged_list}
+    for tok in re.split(r"[\s,]+", (args.force_merged_prs or "").strip()):
+        if tok:
+            force_merged_set.add(tok.lower())
+
     prs, repos = [], {}
     if token:
         try:
-            prs, repos = fetch_contributions_graphql(args.username, token)
+            prs, repos = fetch_contributions_graphql(
+                args.username, token, force_merged_prs=force_merged_set
+            )
         except (
             urllib.error.URLError,
             TimeoutError,
@@ -672,13 +987,39 @@ def main(argv: list[str] | None = None) -> int:
                 f"[pr-showcase] GraphQL query failed ({exc}); falling back to REST API...",
                 file=sys.stderr,
             )
-            prs, repos = fetch_contributions_rest(args.username, token=token)
+            prs, repos = fetch_contributions_rest(
+                args.username, token=token, force_merged_prs=force_merged_set
+            )
     else:
         print(
             "[pr-showcase] No token found; using unauthenticated REST search API...",
             file=sys.stderr,
         )
-        prs, repos = fetch_contributions_rest(args.username, token=None)
+        prs, repos = fetch_contributions_rest(
+            args.username, token=None, force_merged_prs=force_merged_set
+        )
+
+    # Ingest declared co-authored PRs
+    coauth_refs = parse_pr_references(args.coauthored_prs)
+    if coauth_refs:
+        if token:
+            coauth_prs, coauth_repos = fetch_coauthored_prs_graphql(
+                coauth_refs, token, force_merged_prs=force_merged_set
+            )
+        else:
+            coauth_prs, coauth_repos = fetch_coauthored_prs_rest(
+                coauth_refs, token=None, force_merged_prs=force_merged_set
+            )
+
+        existing_keys = {(p["repo"].lower(), p["number"]) for p in prs}
+        for cp in coauth_prs:
+            if (cp["repo"].lower(), cp["number"]) not in existing_keys:
+                prs.append(cp)
+                existing_keys.add((cp["repo"].lower(), cp["number"]))
+
+        for r_name, r_info in coauth_repos.items():
+            if r_name not in repos:
+                repos[r_name] = r_info
 
     if not prs:
         print(

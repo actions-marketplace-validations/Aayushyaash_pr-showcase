@@ -128,6 +128,147 @@ class TestPrShowcaseEngine(unittest.TestCase):
         self.assertTrue(metrics_block.startswith('<p align="left">'))
         self.assertIn('<p align="center">', projects_block)
 
+    def test_synthetic_merge_closer(self):
+        node = {
+            "number": 5083,
+            "title": "Default potential-bad-keyword-argument severity to ignore",
+            "url": "https://github.com/facebook/pyrefly/pull/5083",
+            "state": "CLOSED",
+            "merged": false if False else False,
+            "mergedAt": None,
+            "createdAt": "2026-10-02T06:05:00Z",
+            "timelineItems": {
+                "nodes": [
+                    {
+                        "closer": {
+                            "oid": "16b85b9b2de5fd25c35ef209cedd188a17e1f6a1",
+                            "url": "https://github.com/facebook/pyrefly/commit/16b85b9",
+                        }
+                    }
+                ]
+            },
+            "repository": {
+                "nameWithOwner": "facebook/pyrefly",
+                "name": "pyrefly",
+                "description": "A fast type checker and language server for Python",
+                "stargazerCount": 5000,
+                "owner": {"login": "facebook", "avatarUrl": "https://github.com/facebook.png"},
+            },
+        }
+        prs, repos = engine.parse_graphql_nodes([node])
+        self.assertEqual(len(prs), 1)
+        self.assertEqual(prs[0]["state"], "merged")
+        self.assertEqual(prs[0]["repo"], "facebook/pyrefly")
+
+    def test_synthetic_merge_bot_comment(self):
+        node = {
+            "number": 123,
+            "title": "fix: update internal sync logic",
+            "url": "https://github.com/google/benchmark/pull/123",
+            "state": "CLOSED",
+            "merged": False,
+            "mergedAt": None,
+            "createdAt": "2026-09-01T10:00:00Z",
+            "comments": {
+                "nodes": [
+                    {
+                        "author": {"login": "copybara-service"},
+                        "body": "Closed by commit abc1234def5678",
+                    }
+                ]
+            },
+            "repository": {
+                "nameWithOwner": "google/benchmark",
+                "name": "benchmark",
+                "description": "Benchmark framework",
+                "stargazerCount": 8000,
+                "owner": {"login": "google"},
+            },
+        }
+        prs, _ = engine.parse_graphql_nodes([node])
+        self.assertEqual(len(prs), 1)
+        self.assertEqual(prs[0]["state"], "merged")
+
+    def test_synthetic_merge_rejected_discarded(self):
+        node = {
+            "number": 5041,
+            "title": "for test stack pr",
+            "url": "https://github.com/facebook/pyrefly/pull/5041",
+            "state": "CLOSED",
+            "merged": False,
+            "mergedAt": None,
+            "createdAt": "2026-10-01T10:00:00Z",
+            "timelineItems": {"nodes": [{"closer": None}]},
+            "comments": {
+                "nodes": [
+                    {
+                        "author": {"login": "meta-codesync"},
+                        "body": "This pull request has been imported.",
+                    }
+                ]
+            },
+            "repository": {
+                "nameWithOwner": "facebook/pyrefly",
+                "name": "pyrefly",
+            },
+        }
+        prs, _ = engine.parse_graphql_nodes([node])
+        self.assertEqual(len(prs), 0)
+
+    def test_force_merged_override(self):
+        node = {
+            "number": 999,
+            "title": "fix: rare edge case",
+            "url": "https://github.com/custom/project/pull/999",
+            "state": "CLOSED",
+            "merged": False,
+            "mergedAt": None,
+            "createdAt": "2026-08-01T10:00:00Z",
+            "repository": {
+                "nameWithOwner": "custom/project",
+                "name": "project",
+            },
+        }
+        prs, _ = engine.parse_graphql_nodes([node], force_merged_prs={"custom/project#999"})
+        self.assertEqual(len(prs), 1)
+        self.assertEqual(prs[0]["state"], "merged")
+
+    def test_coauthored_pr_rendering(self):
+        prs = [
+            {
+                "repo": "facebook/pyrefly",
+                "number": 5091,
+                "title": "Fix/protocol explicit self",
+                "url": "https://github.com/facebook/pyrefly/pull/5091",
+                "state": "merged",
+                "created": "2026-10-03",
+                "is_coauthor": True,
+            }
+        ]
+        repos = {
+            "facebook/pyrefly": {
+                "name": "facebook/pyrefly",
+                "description": "Python type checker",
+                "stars": 5000,
+                "owner_avatar": "https://github.com/facebook.png",
+            }
+        }
+        rendered = engine.render(prs, repos)
+        self.assertIn("- [#5091](https://github.com/facebook/pyrefly/pull/5091) Fix/protocol explicit self *(Co-author)*", rendered)
+        self.assertIn("img.shields.io/github/stars/facebook/pyrefly", rendered)
+
+    def test_parse_pr_references(self):
+        raw = "facebook/pyrefly#5091, https://github.com/astral-sh/uv/pull/1234\nother/repo#42"
+        refs = engine.parse_pr_references(raw)
+        self.assertEqual(
+            refs,
+            [
+                ("facebook", "pyrefly", 5091),
+                ("astral-sh", "uv", 1234),
+                ("other", "repo", 42),
+            ],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
