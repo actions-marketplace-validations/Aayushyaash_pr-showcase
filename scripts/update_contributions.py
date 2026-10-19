@@ -581,6 +581,23 @@ def escape_attr(text: str) -> str:
     return text.replace('"', "&quot;").replace("\n", " ").strip()
 
 
+def format_metric(n: int) -> str:
+    """Format integers as SI metrics matching Shields.io conventions (e.g. 7130 -> 7.1k)."""
+    if n < 1000:
+        return str(n)
+    if n < 10000:
+        val = f"{n / 1000.0:.1f}"
+        if val.endswith(".0"):
+            val = val[:-2]
+        return f"{val}k"
+    if n < 1000000:
+        return f"{round(n / 1000.0)}k"
+    val = f"{n / 1000000.0:.1f}"
+    if val.endswith(".0"):
+        val = val[:-2]
+    return f"{val}M"
+
+
 def format_repo_header(repo_info: dict, mode: str) -> str:
     """Format repository header with avatar, link, and tooltip description."""
     repo = repo_info["name"]
@@ -747,12 +764,23 @@ def render_projects_section(prs: list[dict], repos: dict[str, dict], cfg: dict) 
         title_attr = (
             f' title="{escape_attr(desc)}"' if badge_mode == "tooltip" and desc else ""
         )
-        encoded_repo = urllib.parse.quote(repo)
-
         if show_stars:
-            badge_url = f"https://img.shields.io/github/stars/{repo}?style=flat-square&logo=github&label={encoded_repo}&color=1f6feb&labelColor=0d1117"
+            raw_stars = int(repo_info.get("stars", 0))
+            formatted_stars = format_metric(raw_stars)
+            params = urllib.parse.urlencode(
+                {
+                    "label": repo,
+                    "message": formatted_stars,
+                    "color": "1f6feb",
+                    "labelColor": "0d1117",
+                    "style": "flat-square",
+                    "logo": "github",
+                }
+            )
+            badge_url = f"https://img.shields.io/static/v1?{params}"
             badge_alt = f"{repo} stars"
         else:
+            encoded_repo = urllib.parse.quote(repo)
             badge_url = f"https://img.shields.io/badge/{encoded_repo}-1f6feb?style=flat-square&logo=github&logoColor=white&labelColor=0d1117"
             badge_alt = repo
 

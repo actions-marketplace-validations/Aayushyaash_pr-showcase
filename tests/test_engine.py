@@ -61,7 +61,9 @@ class TestPrShowcaseEngine(unittest.TestCase):
         self.assertIn("fix(parser): resolve token stream overflow", rendered)
 
         # Check star badge in cloud
-        self.assertIn("img.shields.io/github/stars/octocat/super-engine", rendered)
+        self.assertIn("img.shields.io/static/v1?", rendered)
+        self.assertIn("message=14k", rendered)
+        self.assertIn("label=octocat%2Fsuper-engine", rendered)
 
     def test_inject_markers_existing(self):
         nodes = self.graphql_data["data"]["search"]["nodes"]
@@ -255,7 +257,9 @@ class TestPrShowcaseEngine(unittest.TestCase):
         }
         rendered = engine.render(prs, repos)
         self.assertIn("- [#5091](https://github.com/facebook/pyrefly/pull/5091) Fix/protocol explicit self *(Co-author)*", rendered)
-        self.assertIn("img.shields.io/github/stars/facebook/pyrefly", rendered)
+        self.assertIn("img.shields.io/static/v1?", rendered)
+        self.assertIn("label=facebook%2Fpyrefly", rendered)
+        self.assertIn("message=5k", rendered)
 
     def test_parse_pr_references(self):
         raw = "facebook/pyrefly#5091, https://github.com/astral-sh/uv/pull/1234\nother/repo#42"
@@ -269,6 +273,53 @@ class TestPrShowcaseEngine(unittest.TestCase):
             ],
         )
 
+    def test_format_metric(self):
+        cases = [
+            (0, "0"),
+            (1, "1"),
+            (950, "950"),
+            (999, "999"),
+            (1000, "1k"),
+            (1050, "1.1k"),
+            (1500, "1.5k"),
+            (7130, "7.1k"),
+            (9990, "10k"),
+            (10000, "10k"),
+            (29400, "29k"),
+            (142000, "142k"),
+            (999999, "1000k"),
+            (1000000, "1M"),
+            (1500000, "1.5M"),
+            (20000000, "20M"),
+        ]
+        for num, expected in cases:
+            with self.subTest(num=num):
+                self.assertEqual(engine.format_metric(num), expected)
+
+    def test_render_star_badge_static_v1(self):
+        prs = [{"repo": "QwenLM/qwen-code", "number": 1, "title": "feat", "url": "url", "state": "merged", "created": "2026-01-01"}]
+        repos = {
+            "QwenLM/qwen-code": {
+                "name": "QwenLM/qwen-code",
+                "description": "Code model",
+                "stars": 29400,
+                "owner_avatar": "avatar_url",
+            }
+        }
+        cfg = engine.get_default_config()
+        cfg["show_stars"] = True
+        rendered = engine.render_projects_section(prs, repos, cfg)
+
+        self.assertIn("img.shields.io/static/v1?", rendered)
+        self.assertIn("label=QwenLM%2Fqwen-code", rendered)
+        self.assertIn("message=29k", rendered)
+        self.assertIn("color=1f6feb", rendered)
+        self.assertIn("labelColor=0d1117", rendered)
+        self.assertIn("style=flat-square", rendered)
+        self.assertIn("logo=github", rendered)
+        self.assertNotIn("img.shields.io/github/stars", rendered)
+
 
 if __name__ == "__main__":
     unittest.main()
+
